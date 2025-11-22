@@ -1,0 +1,7 @@
+{
+  "name": "CEO's Voice Assistant",
+  "description": "A voice-first AI secretary for the CEO, integrated with Supabase for real-time business intelligence.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
