@@ -2,34 +2,35 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, Type, Tool } from '@google/genai';
 import { createPcmBlob, decodeAudioData, base64ToUint8Array } from '../utils/audioUtils';
 import { ConnectionState, LogMessage, GEMINI_API_KEY } from '../types';
-import { searchBusinessData } from '../services/supabaseService';
+import { executeOAQuery, OAQueryResult } from '../services/supabaseService';
 
-// Define the tool for the model
-const searchToolDeclaration: FunctionDeclaration = {
-  name: 'searchBusinessKnowledgeBase',
-  description: 'Search the internal company database for business information, reports, metrics, or policies.',
+// Define the OA Statistics Tool
+const oaStatsTool: FunctionDeclaration = {
+  name: 'get_oa_stats',
+  description: 'Run a specific statistical query against the Owners Association database (vw_building_owner_pending_dues).',
   parameters: {
     type: Type.OBJECT,
     properties: {
-      query: {
+      operation: {
         type: Type.STRING,
-        description: 'The search query to look up in the business database.',
+        enum: ['TOTAL_COLLECTABLES', 'MAX_BUILDING', 'MAX_OWNER', 'COUNT_BUILDINGS'],
+        description: 'The specific statistic to retrieve from the database.',
       },
     },
-    required: ['query'],
+    required: ['operation'],
   },
 };
 
-const TOOLS: Tool[] = [{ functionDeclarations: [searchToolDeclaration] }];
-
+const TOOLS: Tool[] = [{ functionDeclarations: [oaStatsTool] }];
 const MODEL_NAME = 'gemini-2.5-flash-native-audio-preview-09-2025';
 
 export const useGeminiLive = () => {
   const [connectionState, setConnectionState] = useState<ConnectionState>(ConnectionState.DISCONNECTED);
   const [volume, setVolume] = useState<number>(0);
   const [logs, setLogs] = useState<LogMessage[]>([]);
+  const [lastQuery, setLastQuery] = useState<OAQueryResult | null>(null);
 
-  // Refs for audio handling to avoid re-renders
+  // Refs for audio handling
   const audioContextRef = useRef<AudioContext | null>(null);
   const inputSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -63,42 +64,42 @@ export const useGeminiLive = () => {
       const outputCtx = new OutputContextClass({ sampleRate: 24000 });
       outputContextRef.current = outputCtx;
 
-      // Get User Media
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
       const ai = new GoogleGenAI({ apiKey });
 
-      // Start Session
       sessionPromiseRef.current = ai.live.connect({
         model: MODEL_NAME,
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: "You are the Executive Secretary to the CEO. You are professional, efficient, and knowledgeable. You have access to the company's internal Supabase database via the 'searchBusinessKnowledgeBase' tool. When asked a business question, ALWAYS use the tool to find the answer. Do not hallucinate facts. If the tool returns no data, state that you cannot find that information in the records. Keep your spoken responses concise (under 3 sentences unless asked for detail) as this is a voice conversation.",
+          systemInstruction: `You are Nathasha, an Owners Association AI Assistant.
+Your only source of truth is the Supabase view: vw_building_owner_pending_dues.
+You must use the 'get_oa_stats' tool to answer questions.
+Rules:
+1. If asked "Total collectables", use operation='TOTAL_COLLECTABLES'.
+2. If asked "Which building has maximum due", use operation='MAX_BUILDING'.
+3. If asked "Which owner has maximum due", use operation='MAX_OWNER'.
+4. If asked "How many buildings", use operation='COUNT_BUILDINGS'.
+When the tool returns a result, summarize it clearly to the user. The SQL used is automatically shown on their screen, so you don't need to read the SQL code out loud.`,
           tools: TOOLS,
         },
         callbacks: {
           onopen: () => {
             setConnectionState(ConnectionState.CONNECTED);
-            addLog('system', 'Voice session established.');
+            addLog('system', 'Nathasha Connected.');
             
-            // Setup Input Processing
             const source = audioCtx.createMediaStreamSource(stream);
             inputSourceRef.current = source;
             
-            // Use ScriptProcessor for broad compatibility with 16kHz requirement
             const processor = audioCtx.createScriptProcessor(4096, 1, 1);
             processorRef.current = processor;
 
             processor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
-              // Calculate volume for visualizer
               let sum = 0;
-              for (let i = 0; i < inputData.length; i++) {
-                sum += inputData[i] * inputData[i];
-              }
-              const rms = Math.sqrt(sum / inputData.length);
-              setVolume(rms); // Update UI volume
+              for (let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
+              setVolume(Math.sqrt(sum / inputData.length));
 
               const pcmBlob = createPcmBlob(inputData);
               sessionPromiseRef.current?.then(session => {
@@ -110,27 +111,23 @@ export const useGeminiLive = () => {
             processor.connect(audioCtx.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Handle Tool Calls (Supabase Search)
             if (message.toolCall) {
-              addLog('system', 'Model requested information lookup...');
               const functionResponses: any[] = [];
-              
               for (const fc of message.toolCall.functionCalls) {
-                if (fc.name === 'searchBusinessKnowledgeBase') {
-                  const query = (fc.args as any).query;
-                  addLog('system', `Querying Supabase: "${query}"`);
+                if (fc.name === 'get_oa_stats') {
+                  const op = (fc.args as any).operation;
+                  addLog('system', `Running Analysis: ${op}`);
                   
-                  const result = await searchBusinessData(query);
-                  addLog('system', `Data retrieved. Sending to model.`);
+                  const queryResult = await executeOAQuery(op);
+                  setLastQuery(queryResult);
                   
                   functionResponses.push({
                     id: fc.id,
                     name: fc.name,
-                    response: { result },
+                    response: { result: queryResult.result },
                   });
                 }
               }
-
               if (functionResponses.length > 0) {
                  sessionPromiseRef.current?.then(session => {
                     session.sendToolResponse({ functionResponses });
@@ -138,40 +135,31 @@ export const useGeminiLive = () => {
               }
             }
 
-            // Handle Audio Output
             const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (audioData && outputContextRef.current) {
               const ctx = outputContextRef.current;
               const buffer = await decodeAudioData(base64ToUint8Array(audioData), ctx);
-              
               const source = ctx.createBufferSource();
               source.buffer = buffer;
               source.connect(ctx.destination);
-              
-              const currentTime = ctx.currentTime;
-              // Ensure smooth scheduling
-              const startTime = Math.max(nextStartTimeRef.current, currentTime);
+              const startTime = Math.max(nextStartTimeRef.current, ctx.currentTime);
               source.start(startTime);
               nextStartTimeRef.current = startTime + buffer.duration;
             }
             
-            // Handle Interruption
             if (message.serverContent?.interrupted) {
-              addLog('system', 'User interrupted.');
+              addLog('system', 'Interrupted.');
               nextStartTimeRef.current = 0;
-              // In a real app we would stop currently playing nodes here, 
-              // but Web Audio scheduling management is complex for this scope.
-              // Resetting time is the critical part for new audio.
             }
           },
           onclose: () => {
             setConnectionState(ConnectionState.DISCONNECTED);
-            addLog('system', 'Session closed.');
+            addLog('system', 'Session disconnected.');
           },
           onerror: (err) => {
             console.error(err);
             setConnectionState(ConnectionState.ERROR);
-            addLog('system', 'Session error occurred.');
+            addLog('system', 'Connection error.');
           }
         }
       });
@@ -179,40 +167,20 @@ export const useGeminiLive = () => {
     } catch (e: any) {
       console.error(e);
       setConnectionState(ConnectionState.ERROR);
-      addLog('system', `Connection failed: ${e.message}`);
+      addLog('system', `Failed: ${e.message}`);
     }
   }, []);
 
   const disconnect = useCallback(async () => {
     if (sessionPromiseRef.current) {
-      const session = await sessionPromiseRef.current;
-      // There isn't a direct disconnect on the session object in the provided snippet,
-      // but we can close local resources.
-      // Usually, closing the input stream ends the session effectively or we wait for server timeout.
-      // However, proper cleanup:
+      // Cleanup would go here
     }
-    
-    // Stop local audio
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
-      streamRef.current = null;
-    }
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
-    }
-    if (inputSourceRef.current) {
-      inputSourceRef.current.disconnect();
-      inputSourceRef.current = null;
-    }
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-    if (outputContextRef.current) {
-      outputContextRef.current.close();
-      outputContextRef.current = null;
-    }
+    if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
+    processorRef.current?.disconnect();
+    inputSourceRef.current?.disconnect();
+    audioContextRef.current?.close();
+    outputContextRef.current?.close();
     setConnectionState(ConnectionState.DISCONNECTED);
     setVolume(0);
   }, []);
@@ -222,6 +190,7 @@ export const useGeminiLive = () => {
     disconnect,
     connectionState,
     volume,
-    logs
+    logs,
+    lastQuery
   };
 };
