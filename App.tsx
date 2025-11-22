@@ -65,7 +65,7 @@ const App: React.FC = () => {
       {/* Main Area */}
       <main className="flex-1 w-full max-w-md flex flex-col items-center justify-center z-10 gap-6 my-4">
         
-        <Visualizer volume={volume} isActive={isConnected} />
+        <Visualizer volume={volume} state={connectionState} />
 
         <div className="text-center space-y-2">
           <h2 className={`text-xl font-light transition-colors duration-300 ${isConnected ? 'text-emerald-100' : 'text-slate-400'}`}>
